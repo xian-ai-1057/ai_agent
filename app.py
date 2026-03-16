@@ -154,6 +154,7 @@ with st.sidebar:
             del st.session_state["agent"]
         if "chat_history" in st.session_state:
             del st.session_state["chat_history"]
+        st.session_state.pop("token_usage", None)
         st.rerun()
 
     # 即時同步滑桿值（不需重建 agent）
@@ -168,6 +169,7 @@ with st.sidebar:
         if "agent" in st.session_state:
             st.session_state["agent"].reset()
         st.session_state["chat_history"] = []
+        st.session_state.pop("token_usage", None)
         st.rerun()
 
     # 下載對話記錄
@@ -183,6 +185,52 @@ with st.sidebar:
             mime="text/plain",
             use_container_width=True,
         )
+
+    # --- Token 用量面板 ---
+    st.divider()
+    st.subheader("📊 Token 用量")
+
+    threshold = config.COMPACTION_THRESHOLD
+    usage = st.session_state.get("token_usage")
+
+    if usage:
+        prompt_tokens = usage.get("prompt_tokens", 0)
+        completion_tokens = usage.get("completion_tokens", 0)
+
+        if threshold > 0:
+            remaining = threshold - prompt_tokens
+            ratio = min(prompt_tokens / threshold, 1.0)
+
+            st.metric(
+                "Prompt Tokens",
+                f"{prompt_tokens:,}",
+            )
+            st.metric(
+                "距離 Compaction",
+                f"{remaining:,} tokens",
+                delta=f"{-prompt_tokens:,}",
+                delta_color="inverse",
+            )
+            st.progress(
+                ratio,
+                text=(
+                    f"{ratio:.0%}（"
+                    f"{prompt_tokens:,} / {threshold:,}）"
+                ),
+            )
+        else:
+            st.metric(
+                "Prompt Tokens",
+                f"{prompt_tokens:,}",
+            )
+            st.caption("Compaction 已停用")
+
+        st.caption(
+            f"Completion: {completion_tokens:,} · "
+            f"Compaction 閾值: {threshold:,}"
+        )
+    else:
+        st.caption("尚未有 Token 用量資訊（發送訊息後顯示）")
 
 
 # ============================================================
@@ -286,6 +334,11 @@ if user_input:
                 result = agent.chat_with_trace(user_input)
                 reply = result["content"]
                 trace = result["trace"]
+                # 更新 token 用量
+                if result.get("usage"):
+                    st.session_state["token_usage"] = (
+                        result["usage"]
+                    )
             except Exception as e:
                 reply = f"⚠️ 發生錯誤: {e}"
                 trace = []
