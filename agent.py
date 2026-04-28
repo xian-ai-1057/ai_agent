@@ -3,6 +3,9 @@
 使用原生 requests 呼叫 vLLM OpenAI 相容 API，
 自行實作 ReAct Agent Loop（tool calling 迴圈）。
 
+工具層改走 MCP：透過 MCPStdioClient 與 mcp_server 對談，
+所有 skill metadata 與檔案讀取皆由 MCP server 提供。
+
 System Prompt 從外部 .md 檔案載入，支援模組化組裝。
 """
 import json
@@ -12,10 +15,10 @@ from pathlib import Path
 import requests
 
 import config
-from skill_manager import SkillManager
+from mcp_client import MCPStdioClient, default_server_command
 from tools import (
     ToolExecutor,
-    get_tool_schemas,
+    mcp_tools_to_openai_schemas,
     parse_tool_calls,
 )
 
@@ -76,7 +79,7 @@ def load_prompt_template(
 
 
 def build_system_prompt(
-    manager: SkillManager,
+    registry: "SkillRegistry",
     prompt_path: str | Path | None = None,
 ) -> str:
     """組裝完整的 system prompt。
@@ -86,17 +89,83 @@ def build_system_prompt(
     - {available_skills}: 所有 skill 的 metadata XML
 
     Args:
-        manager: 已初始化的 SkillManager。
+        registry: 已快取 skill metadata 的 SkillRegistry。
         prompt_path: 自訂 prompt 檔案路徑（可選）。
 
     Returns:
         完整的 system prompt 字串。
     """
     template = load_prompt_template(prompt_path)
-    registry_prompt = manager.build_registry_prompt()
+    registry_prompt = registry.build_registry_prompt()
     return template.format(
         available_skills=registry_prompt
     )
+
+
+class SkillRegistry:
+    """Skill metadata 快取，從 MCP server 取得後格式化供 prompt 使用。
+
+    取代原本 SkillManager 對 agent / UI 暴露的 list_skills 與
+    build_registry_prompt 介面。實際的 skill 內容讀取仍走
+    MCP server 的 tool call。
+    """
+
+    def __init__(self, client: MCPStdioClient) -> None:
+        """初始化並透過 MCP 取得 skill 列表。
+
+        Args:
+            client: 已連線的 MCPStdioClient。
+        """
+        self._client = client
+        self._skills: list[dict[str, str]] = self._fetch_skills()
+
+    def _fetch_skills(self) -> list[dict[str, str]]:
+        """呼叫 MCP server 的 list_skills 工具並解析結果。"""
+        try:
+            text = self._client.call_tool("list_skills", {})
+            data = json.loads(text) if text else []
+        except Exception as e:
+            logger.error("從 MCP 取得 skill 列表失敗: %s", e)
+            return []
+
+        if not isinstance(data, list):
+            logger.warning(
+                "list_skills 回傳格式不正確: %r", data
+            )
+            return []
+        return data
+
+    def list_skills(self) -> list[dict[str, str]]:
+        """取得所有 skill 的 (name, description) 列表。"""
+        return list(self._skills)
+
+    def build_registry_prompt(self) -> str:
+        """產生注入 system prompt 的 <available_skills> XML 區塊。"""
+        if not self._skills:
+            return ""
+
+        entries = []
+        for meta in self._skills:
+            name = meta.get("name", "")
+            desc = meta.get("description", "（無描述）")
+            desc = " ".join(desc.split())
+            entries.append(
+                f"<skill>\n"
+                f"  <name>{name}</name>\n"
+                f"  <description>{desc}</description>\n"
+                f"</skill>"
+            )
+
+        skills_xml = "\n".join(entries)
+        return (
+            f"<available_skills>\n"
+            f"{skills_xml}\n"
+            f"</available_skills>"
+        )
+
+    def refresh(self) -> None:
+        """強制重新從 server 拉取 skill 列表。"""
+        self._skills = self._fetch_skills()
 
 
 def _call_api(
@@ -225,12 +294,14 @@ class SkillAgent:
     """Skill Agent 主體。
 
     管理對話狀態、執行 ReAct 迴圈、自動 Compaction。
+    工具層透過 MCPStdioClient 與 mcp_server 互動。
 
     Attributes:
-        manager: SkillManager 實例。
-        executor: 工具執行器。
+        mcp_client: 已連線的 MCPStdioClient。
+        manager: SkillRegistry，向後相容 SkillManager 的部分介面。
+        executor: 透過 MCP 派送工具呼叫的 ToolExecutor。
         system_prompt: 組裝後的 system prompt。
-        tool_schemas: 工具定義列表。
+        tool_schemas: OpenAI 格式的工具定義列表（已過濾內部工具）。
         messages: 對話歷史。
     """
 
@@ -238,32 +309,69 @@ class SkillAgent:
         self,
         skills_dir: str | None = None,
         prompt_path: str | Path | None = None,
+        mcp_command: list[str] | None = None,
     ) -> None:
         """初始化 Agent。
 
         Args:
-            skills_dir: skills 根目錄。
-                若為 None 使用 config.SKILLS_DIR。
+            skills_dir: skills 根目錄。若為 None，使用 config 預設值；
+                會以環境變數 SKILL_AGENT_SKILLS_DIR 傳給 server 子行程。
             prompt_path: 自訂 system prompt 檔案路徑。
                 若為 None 使用預設的 prompts/system_prompt.md。
+            mcp_command: 自訂 MCP server 啟動命令；
+                若為 None 使用內建的 mcp_server.py。
         """
         if skills_dir is None:
             skills_dir = config.SKILLS_DIR
+        if mcp_command is None:
+            mcp_command = default_server_command()
 
-        self.manager = SkillManager(skills_dir)
-        self.executor = ToolExecutor(self.manager)
-        self.system_prompt = build_system_prompt(
-            self.manager, prompt_path
+        # 啟動 MCP server 子行程並完成 initialize 握手
+        self.mcp_client = MCPStdioClient(
+            mcp_command,
+            env={"SKILL_AGENT_SKILLS_DIR": skills_dir},
         )
-        self.tool_schemas = get_tool_schemas()
+
+        try:
+            mcp_tools = self.mcp_client.list_tools()
+            self.tool_schemas = mcp_tools_to_openai_schemas(
+                mcp_tools
+            )
+            self.manager = SkillRegistry(self.mcp_client)
+            self.executor = ToolExecutor(self.mcp_client)
+            self.system_prompt = build_system_prompt(
+                self.manager, prompt_path
+            )
+        except Exception:
+            self.mcp_client.close()
+            raise
+
         self.messages: list[dict] = []
         self._last_prompt_tokens: int = 0
 
         logger.info(
-            "Agent 初始化完成 (模型=%s, skills=%d)",
+            "Agent 初始化完成 (模型=%s, skills=%d, MCP tools=%d)",
             config.MODEL_NAME,
-            len(self.manager.registry),
+            len(self.manager.list_skills()),
+            len(self.tool_schemas),
         )
+
+    def close(self) -> None:
+        """關閉 MCP client 與 server 子行程。"""
+        if hasattr(self, "mcp_client"):
+            self.mcp_client.close()
+
+    def __enter__(self) -> "SkillAgent":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def reset(self) -> None:
         """重置對話歷史與 token 追蹤。"""

@@ -1,105 +1,81 @@
-"""Skill Agent 工具定義。
+"""Skill Agent 工具層（MCP 版本）。
 
-定義 OpenAI function calling 格式的工具 schema，
-以及工具執行分派器。不依賴任何框架。
+工具的 schema 與執行皆透過 MCP client 與 mcp_server 互動。
+本模組負責：
+- 將 MCP 的 tool 定義轉成 OpenAI function calling schema
+- 將模型回傳的 tool_calls 派送給 MCP client 執行
+- 解析模型的 tool_calls 結構（標準化 arguments）
 """
+from __future__ import annotations
+
 import json
 import logging
 from typing import Any
 
-from skill_manager import SkillManager
+from mcp_client import MCPStdioClient
 
 logger = logging.getLogger(__name__)
 
-# --- OpenAI Tool Schema 定義 ---
-
-TOOL_READ_SKILL = {
-    "type": "function",
-    "function": {
-        "name": "read_skill",
-        "description": (
-            "讀取指定 skill 的完整指引（SKILL.md）。"
-            "當使用者的問題與某個 skill 的描述相符時，"
-            "呼叫此工具來載入該 skill 的完整指引，"
-            "然後嚴格按照指引中的流程和格式來回覆使用者。"
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "skill_name": {
-                    "type": "string",
-                    "description": (
-                        "skill 名稱，必須是 "
-                        "available_skills 中列出的名稱之一"
-                    ),
-                },
-            },
-            "required": ["skill_name"],
-        },
-    },
-}
-
-TOOL_READ_REFERENCE = {
-    "type": "function",
-    "function": {
-        "name": "read_skill_reference",
-        "description": (
-            "讀取 skill 的補充參考資料。"
-            "當 SKILL.md 中提到需要參考 references/ 下的"
-            "特定檔案時，使用此工具載入。"
-            "不要主動猜測檔案名稱，"
-            "請依據 SKILL.md 中的明確指示來呼叫。"
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "skill_name": {
-                    "type": "string",
-                    "description": "skill 名稱",
-                },
-                "filename": {
-                    "type": "string",
-                    "description": (
-                        "參考檔案名稱，"
-                        "如 antipatterns.md"
-                    ),
-                },
-            },
-            "required": ["skill_name", "filename"],
-        },
-    },
-}
+# 不暴露給 LLM 的內部工具（client 端用來建立 skill registry 索引）
+_INTERNAL_TOOL_NAMES = {"list_skills"}
 
 
-def get_tool_schemas() -> list[dict]:
-    """取得所有工具的 OpenAI function calling schema。
+def mcp_tools_to_openai_schemas(
+    mcp_tools: list[dict[str, Any]],
+    exclude: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    """將 MCP 的 tool 定義列表轉成 OpenAI function calling schema。
+
+    MCP 格式: {name, description, inputSchema}
+    OpenAI 格式: {"type": "function",
+                  "function": {name, description, parameters}}
+
+    Args:
+        mcp_tools: MCP server 回傳的 tools 列表。
+        exclude: 不轉換的工具名稱集合（預設排除內部工具）。
 
     Returns:
-        工具定義列表，可直接放入 API 請求的 tools 欄位。
+        OpenAI tools 格式的列表，可直接放入 chat.completions 請求。
     """
-    return [TOOL_READ_SKILL, TOOL_READ_REFERENCE]
+    if exclude is None:
+        exclude = _INTERNAL_TOOL_NAMES
+
+    schemas = []
+    for tool in mcp_tools:
+        name = tool.get("name", "")
+        if name in exclude:
+            continue
+        schemas.append({
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": tool.get("description", ""),
+                "parameters": tool.get(
+                    "inputSchema",
+                    {"type": "object", "properties": {}},
+                ),
+            },
+        })
+    return schemas
 
 
 class ToolExecutor:
-    """工具執行分派器。
+    """工具執行分派器（MCP 後端）。
 
-    將模型回傳的 tool_calls 對應到實際的函式執行。
+    將模型回傳的 tool_calls 透過 MCP client 送到 server 執行，
+    並回傳合併後的 text content。
 
     Attributes:
-        manager: SkillManager 實例。
+        client: 已連線的 MCPStdioClient。
     """
 
-    def __init__(self, manager: SkillManager) -> None:
+    def __init__(self, client: MCPStdioClient) -> None:
         """初始化。
 
         Args:
-            manager: 已初始化的 SkillManager。
+            client: 已完成 initialize 握手的 MCPStdioClient。
         """
-        self.manager = manager
-        self._dispatch = {
-            "read_skill": self._exec_read_skill,
-            "read_skill_reference": self._exec_read_reference,
-        }
+        self.client = client
 
     def execute(
         self, tool_name: str, arguments: dict[str, Any]
@@ -111,36 +87,15 @@ class ToolExecutor:
             arguments: 工具參數字典。
 
         Returns:
-            工具執行結果的文字內容。
+            MCP server 回傳的 text content（多段時以換行串接）。
+            執行例外時回傳錯誤訊息字串，不向上拋出。
         """
-        handler = self._dispatch.get(tool_name)
-        if handler is None:
-            msg = f"未知的工具: {tool_name}"
-            logger.warning(msg)
-            return msg
         try:
-            return handler(arguments)
+            return self.client.call_tool(tool_name, arguments)
         except Exception as e:
             msg = f"工具 {tool_name} 執行失敗: {e}"
             logger.error(msg)
             return msg
-
-    def _exec_read_skill(self, args: dict) -> str:
-        """執行 read_skill。"""
-        skill_name = args.get("skill_name", "")
-        logger.info("載入 skill: %s", skill_name)
-        return self.manager.read_skill(skill_name)
-
-    def _exec_read_reference(self, args: dict) -> str:
-        """執行 read_skill_reference。"""
-        skill_name = args.get("skill_name", "")
-        filename = args.get("filename", "")
-        logger.info(
-            "載入 reference: %s/%s", skill_name, filename
-        )
-        return self.manager.read_reference(
-            skill_name, filename
-        )
 
 
 def parse_tool_calls(
